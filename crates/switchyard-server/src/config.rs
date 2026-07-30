@@ -20,6 +20,7 @@ use switchyard_llm_client::{
     Backend, HttpBackendConfig, ModelConfig, TranslatingLlmClient, DEFAULT_MAX_RETRIES,
 };
 
+use crate::capabilities::ModelCapabilities;
 use crate::{ServerError, ServerResult, ServerState};
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
@@ -70,10 +71,9 @@ impl ServerConfig {
         for (route_name, config) in &self.routes {
             validate_value("route name", route_name)?;
             validate_value(&format!("route {route_name} id"), config.id())?;
-            routes.push((
-                config.id().to_string(),
-                build_algorithm(route_name, config, &targets)?,
-            ));
+            let algorithm = build_algorithm(route_name, config, &targets)?;
+            let capabilities = route_capabilities(config, &self.targets);
+            routes.push((config.id().to_string(), algorithm, capabilities));
         }
         ServerState::new(routes)
     }
@@ -91,6 +91,11 @@ impl ServerConfig {
         for (target_name, target) in &self.targets {
             validate_value("target name", target_name)?;
             validate_value(&format!("target {target_name} id"), &target.id)?;
+            if target.context_window == Some(0) {
+                return Err(ServerError::new(format!(
+                    "target {target_name} context_window must be greater than zero"
+                )));
+            }
             let client_config = self.llm_clients.get(&target.llm_client).ok_or_else(|| {
                 ServerError::new(format!(
                     "target {target_name} references unknown llm client {}",
@@ -159,6 +164,24 @@ struct TargetConfig {
     llm_client: String,
     #[serde(default)]
     extra_body: BTreeMap<String, Value>,
+    /// Operator-declared context window (tokens) for this target's model,
+    /// advertised on `GET /v1/models`. Unset → the route reports null.
+    #[serde(default)]
+    context_window: Option<u32>,
+    /// Operator-declared tool-calling support for this target's model. Unset →
+    /// the route reports null.
+    #[serde(default)]
+    tool_calling: Option<bool>,
+}
+
+impl TargetConfig {
+    /// The capability hints the operator declared for this target.
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            context_window: self.context_window,
+            tool_calling: self.tool_calling,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -399,6 +422,46 @@ fn tier_prompts(
     prompts
 }
 
+/// Capabilities advertised for a route on `GET /v1/models`, combined from the
+/// operator-declared hints of the targets the route can serve a response from.
+/// `build_algorithm` has already resolved every serving target, so a missing
+/// lookup here is unreachable; if one did happen it counts as an undeclared tier
+/// (`default`), which makes the route report null rather than a wrong value.
+fn route_capabilities(
+    config: &RouteConfig,
+    targets: &BTreeMap<String, TargetConfig>,
+) -> ModelCapabilities {
+    let declared = serving_target_names(config).into_iter().map(|name| {
+        targets
+            .get(name)
+            .map(TargetConfig::capabilities)
+            .unwrap_or_default()
+    });
+    ModelCapabilities::for_targets(declared)
+}
+
+/// Names of the targets a route can serve a response from. A classifier or
+/// stage-router judge target only scores the request and never produces the
+/// client's response, so it is excluded — the advertised context window must
+/// reflect the tiers that actually answer.
+fn serving_target_names(config: &RouteConfig) -> Vec<&str> {
+    match config {
+        RouteConfig::Noop { .. } => Vec::new(),
+        RouteConfig::Random { targets, .. } => targets.iter().map(String::as_str).collect(),
+        RouteConfig::Passthrough { target, .. } => vec![target.as_str()],
+        RouteConfig::LlmClassifier {
+            strong_target,
+            weak_target,
+            ..
+        } => vec![weak_target.as_str(), strong_target.as_str()],
+        RouteConfig::StageRouter {
+            capable_target,
+            efficient_target,
+            ..
+        } => vec![capable_target.as_str(), efficient_target.as_str()],
+    }
+}
+
 fn resolve_targets<'a>(
     route_name: &str,
     names: impl IntoIterator<Item = &'a str>,
@@ -574,6 +637,13 @@ target = "weak"
                 VALID_CONFIG.replace("[targets.strong]", "[targets.\" strong \"]"),
                 "target name must be non-empty and have no surrounding whitespace",
             ),
+            (
+                VALID_CONFIG.replace(
+                    "llm_client = \"responses\"",
+                    "llm_client = \"responses\"\ncontext_window = 0",
+                ),
+                "target strong context_window must be greater than zero",
+            ),
         ];
 
         for (toml, expected) in cases {
@@ -582,6 +652,44 @@ target = "weak"
                 "expected error containing {expected}"
             );
         }
+    }
+
+    #[test]
+    fn route_capabilities_aggregate_declared_target_hints() -> ServerResult<()> {
+        // Declare a window and tool calling on both serving tiers; the random
+        // route over them advertises the smaller window and tool calling.
+        let configured = VALID_CONFIG
+            .replace(
+                "llm_client = \"responses\"",
+                "llm_client = \"responses\"\ncontext_window = 1000000\ntool_calling = true",
+            )
+            .replace(
+                "llm_client = \"anthropic\"",
+                "llm_client = \"anthropic\"\ncontext_window = 200000\ntool_calling = true",
+            );
+        let config: ServerConfig = toml::from_str(&configured)
+            .map_err(|error| ServerError::new(format!("failed to parse config: {error}")))?;
+
+        let random = config
+            .routes
+            .get("random")
+            .ok_or_else(|| ServerError::new("random route is missing"))?;
+        let caps = route_capabilities(random, &config.targets);
+        assert_eq!(caps.context_window, Some(200_000));
+        assert_eq!(caps.tool_calling, Some(true));
+
+        // The classifier route judges through the undeclared `classifier` target
+        // and serves from `strong` + `weak`. The judge is excluded, so the route
+        // still reports the serving tiers' hints; were the judge included, its
+        // undeclared window would force the route to null.
+        let classified = config
+            .routes
+            .get("classifier")
+            .ok_or_else(|| ServerError::new("classifier route is missing"))?;
+        let classified_caps = route_capabilities(classified, &config.targets);
+        assert_eq!(classified_caps.context_window, Some(200_000));
+        assert_eq!(classified_caps.tool_calling, Some(true));
+        Ok(())
     }
 
     #[test]
