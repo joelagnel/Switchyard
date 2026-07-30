@@ -220,6 +220,24 @@ fn record_routing_overhead(
     Some(overhead)
 }
 
+/// Records one classifier fail-open event: the judge was unavailable, so the
+/// request routed without a verdict. `reason` is a bounded, content-free label
+/// (`transport`, `timeout`, `upstream_4xx`, `upstream_5xx`, `invalid_response`,
+/// `parse_error`, ...). A deliberate low-confidence verdict is not a fail-open
+/// and is not counted here — only judge failures reach this.
+pub(crate) fn record_classifier_fail_open(judge_model: &str, reason: &'static str) {
+    meter()
+        .u64_counter("switchyard.classifier_fail_open")
+        .build()
+        .add(
+            1,
+            &[
+                KeyValue::new("judge_model", judge_model.to_string()),
+                KeyValue::new("reason", reason),
+            ],
+        );
+}
+
 /// Records the resolution of one offloaded model call: the call counter and
 /// latency histogram, the `outcome`/`error`/token fields on `span`, and a warn
 /// log when the call failed.

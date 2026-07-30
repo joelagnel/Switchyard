@@ -32,7 +32,9 @@ use switchyard_libsy::{
     AggLlmResponse, Algorithm, Context, Decision, Driver, LibsyError, LlmResponse, LlmTarget,
     LlmTargetSet, Metadata, Request, Response, RoutedLlmClient, Step, Usage,
 };
-use switchyard_protocol::{text_request, text_response, LlmClientError};
+use switchyard_protocol::{
+    completion_text, text_request, text_response, LlmClientError, LlmResponseChunk,
+};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -827,6 +829,254 @@ async fn classifier_metrics_count_only_the_final_routed_call() -> switchyard_lib
     assert!(
         (60..200).contains(&overhead),
         "expected roughly the classifier's 60ms, got {overhead}ms"
+    );
+    Ok(())
+}
+
+fn transport_error() -> LlmClientError {
+    LlmClientError::Transport {
+        source: "connection refused".into(),
+    }
+}
+
+fn http_500() -> LlmClientError {
+    LlmClientError::UpstreamHttp {
+        status: 500,
+        body: "server error".to_string(),
+    }
+}
+
+fn http_429() -> LlmClientError {
+    LlmClientError::UpstreamHttp {
+        status: 429,
+        body: "rate limited".to_string(),
+    }
+}
+
+fn timeout_error() -> LlmClientError {
+    LlmClientError::Timeout {
+        source: "deadline exceeded".into(),
+    }
+}
+
+fn other_client_error() -> LlmClientError {
+    LlmClientError::General("unexpected client failure".to_string())
+}
+
+/// How the judge call behaves in a fail-open test: the call fails, it streams a
+/// reply that fails to decode, or it succeeds with text that is either a valid
+/// verdict (`GoodReply`) or one the parser rejects (`BadReply`).
+enum JudgeOutcome {
+    CallError(fn() -> LlmClientError),
+    BadReply(&'static str),
+    GoodReply(&'static str),
+    StreamDecodeError,
+}
+
+/// Drives one judge outcome — a failure, a stream that fails to decode, or a
+/// valid/invalid reply — and serves the routed call normally, so a test can
+/// exercise each fail-open branch of the classifier and its non-fail-open path.
+struct FailingJudgeClient {
+    outcome: JudgeOutcome,
+}
+
+#[async_trait]
+impl RoutedLlmClient for FailingJudgeClient {
+    async fn call(
+        &self,
+        _ctx: Context,
+        _request: Request,
+        decision: Arc<dyn Decision>,
+    ) -> Result<Response, LlmClientError> {
+        if decision.is_routed_call() {
+            return Ok(Response {
+                llm_response: LlmResponse::Agg(text_response(
+                    Some(decision.selected_model().to_string()),
+                    "routed response",
+                )),
+                metadata: None,
+            });
+        }
+        match &self.outcome {
+            JudgeOutcome::CallError(make) => Err(make()),
+            // Both carry judge text; only the verdict parser tells them apart.
+            JudgeOutcome::BadReply(text) | JudgeOutcome::GoodReply(text) => Ok(Response {
+                llm_response: LlmResponse::Agg(text_response(None, *text)),
+                metadata: None,
+            }),
+            // A judge reply whose chunk fails to decode, so draining the stream
+            // fails at the aggregate fold.
+            JudgeOutcome::StreamDecodeError => Ok(Response {
+                llm_response: LlmResponse::Stream(
+                    futures::stream::iter([Ok(LlmResponseChunk::DecodeError {
+                        message: "bad judge chunk".to_string(),
+                    })])
+                    .boxed(),
+                ),
+                metadata: None,
+            }),
+        }
+    }
+}
+
+/// Build an `LlmTaskClassifier` whose judge target is named `judge_model`, backed
+/// by `client`. Mirrors the metrics test's setup so the judge and routed calls
+/// share one client.
+fn fail_open_router(
+    judge_model: &str,
+    client: Arc<dyn RoutedLlmClient>,
+) -> switchyard_libsy::Result<Arc<dyn Algorithm>> {
+    // Tier names are unique to this file: metrics are global and cumulative, so
+    // reusing "weak"/"strong" would collide with the other tests' assertions.
+    let target = |name: &str| LlmTarget {
+        semantic_name: name.to_string(),
+        llm_client: Some(client.clone()),
+    };
+    let targets = LlmTargetSet::new(vec![
+        target(judge_model),
+        target("fo-weak"),
+        target("fo-strong"),
+    ]);
+    let efficient = targets.get_target("fo-weak")?;
+    let capable = targets.get_target("fo-strong")?;
+    Ok(Arc::new(LlmTaskClassifier::new(
+        target(judge_model),
+        efficient,
+        capable,
+        TaskClassifierConfig {
+            base_threshold: 0.5,
+            ..Default::default()
+        },
+    )?))
+}
+
+fn classify_request() -> Request {
+    Request {
+        llm_request: text_request(Some("auto".to_string()), "classify this"),
+        raw_request: None,
+        metadata: None,
+    }
+}
+
+/// Every judge failure — a timeout, a transport error, upstream HTTP (4xx/5xx),
+/// an unparseable reply, a streamed reply that fails to decode, and an
+/// uncategorized client error — falls open to the capable tier and increments the
+/// fail-open counter once with the matching reason label. A unique judge model
+/// per case keeps the cumulative counters from colliding.
+#[tokio::test]
+async fn classifier_fail_open_is_counted_by_reason() -> switchyard_libsy::Result<()> {
+    let _guard = serialize_test().lock().await;
+    let (_store, exporter, provider) = telemetry();
+
+    let cases: [(&str, JudgeOutcome, &str); 7] = [
+        (
+            "fo-timeout",
+            JudgeOutcome::CallError(timeout_error),
+            "timeout",
+        ),
+        (
+            "fo-transport",
+            JudgeOutcome::CallError(transport_error),
+            "transport",
+        ),
+        (
+            "fo-http5xx",
+            JudgeOutcome::CallError(http_500),
+            "upstream_5xx",
+        ),
+        (
+            "fo-http4xx",
+            JudgeOutcome::CallError(http_429),
+            "upstream_4xx",
+        ),
+        (
+            "fo-parse",
+            JudgeOutcome::BadReply("not json at all"),
+            "parse_error",
+        ),
+        (
+            "fo-stream-decode",
+            JudgeOutcome::StreamDecodeError,
+            "invalid_response",
+        ),
+        (
+            "fo-client-error",
+            JudgeOutcome::CallError(other_client_error),
+            "client_error",
+        ),
+    ];
+
+    for (judge_model, outcome, reason) in cases {
+        let client = Arc::new(FailingJudgeClient { outcome }) as Arc<dyn RoutedLlmClient>;
+        let (trace, response) = fail_open_router(judge_model, client)?
+            .run(Context::default(), classify_request())
+            .await?;
+
+        // The failing judge falls open to the capable target and still serves.
+        assert_eq!(
+            trace.last().map(|decision| decision.selected_model()),
+            Some("fo-strong"),
+            "case {reason} did not fall open to the capable target"
+        );
+        assert_eq!(
+            response
+                .llm_response
+                .as_agg()
+                .map(completion_text)
+                .unwrap_or_default(),
+            "routed response"
+        );
+
+        // The fail-open counter incremented once for this reason and judge model.
+        let snapshots = flushed_metrics(exporter, provider);
+        assert_eq!(
+            u64_counter_value(
+                &snapshots,
+                "switchyard.classifier_fail_open",
+                &[("reason", reason), ("judge_model", judge_model)],
+            ),
+            Some(1),
+            "case {reason} did not count the fail-open"
+        );
+    }
+    Ok(())
+}
+
+/// A judge that returns a valid verdict is a deliberate routing decision, not a
+/// fail-open. The verdict here routes to the capable tier — the same tier a
+/// fail-open falls back to — so the counter, not the routed tier, is what proves
+/// nothing was counted.
+#[tokio::test]
+async fn valid_verdict_is_not_counted_as_a_fail_open() -> switchyard_libsy::Result<()> {
+    let _guard = serialize_test().lock().await;
+    let (_store, exporter, provider) = telemetry();
+    const JUDGE: &str = "fo-valid";
+
+    // A valid verdict with low p_solve routes to the capable tier — the same tier
+    // a fail-open falls back to — so the routed tier alone cannot tell them apart.
+    let client = Arc::new(FailingJudgeClient {
+        outcome: JudgeOutcome::GoodReply(
+            r#"{"recommended_route":"strong","p_solve":0.3,"confidence":0.9,"abstain":false,"capability_boundary":"supported","primary_rule":"CAP-1","crux":"hard task"}"#,
+        ),
+    }) as Arc<dyn RoutedLlmClient>;
+    let (trace, _response) = fail_open_router(JUDGE, client)?
+        .run(Context::default(), classify_request())
+        .await?;
+
+    // Routed on the verdict (p_solve 0.3 → capable tier), not on a fail-open.
+    assert_eq!(
+        trace.last().map(|decision| decision.selected_model()),
+        Some("fo-strong")
+    );
+    // No fail-open counted for this judge under any reason label.
+    let snapshots = flushed_metrics(exporter, provider);
+    assert_eq!(
+        u64_counter_value(
+            &snapshots,
+            "switchyard.classifier_fail_open",
+            &[("judge_model", JUDGE)],
+        ),
+        None
     );
     Ok(())
 }

@@ -15,8 +15,8 @@ use serde_json::Value;
 use switchyard_protocol::{completion_text, AggLlmResponse};
 
 use crate::{
-    Classification, Classifier, Context, Decision, Driver, LibsyError, LlmTarget, Request,
-    Response, Result, State,
+    Classification, Classifier, Context, Decision, Driver, LibsyError, LlmClientError, LlmTarget,
+    Request, Response, Result, State,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -83,14 +83,6 @@ where
         driver: &Driver,
     ) -> Option<J::Verdict> {
         let judge_model = self.target.semantic_name.as_str();
-        let warn = |error: &dyn std::fmt::Display| {
-            tracing::warn!(
-                target: "libsy",
-                judge_model,
-                error = %error,
-                "judge verdict unavailable; routing without one"
-            );
-        };
 
         let response = driver
             .call_llm_target(
@@ -102,18 +94,55 @@ where
                 }),
             )
             .await
-            .inspect_err(|error| warn(error))
+            .inspect_err(|error| report_fail_open(judge_model, error, libsy_error_reason(error)))
             .ok()?;
         let aggregate = response
             .llm_response
             .into_agg()
             .await
-            .inspect_err(|error| warn(error))
+            .inspect_err(|error| report_fail_open(judge_model, error, client_error_reason(error)))
             .ok()?;
         self.judge
             .parse(&aggregate)
-            .inspect_err(|error| warn(error))
+            .inspect_err(|error| report_fail_open(judge_model, error, "parse_error"))
             .ok()
+    }
+}
+
+/// Logs and counts one judge failure. Without a verdict the request routes on
+/// the composition's fallback, so a failing judge lowers routing quality but
+/// never drops the request. `reason` is a bounded, content-free label.
+fn report_fail_open(judge_model: &str, error: &dyn std::fmt::Display, reason: &'static str) {
+    tracing::warn!(
+        target: "libsy",
+        judge_model,
+        reason,
+        error = %error,
+        "judge verdict unavailable; routing without one"
+    );
+    crate::observability::record_classifier_fail_open(judge_model, reason);
+}
+
+/// Bounded fail-open reason for a judge call that failed at the libsy layer.
+fn libsy_error_reason(error: &LibsyError) -> &'static str {
+    match error {
+        LibsyError::ClientCall { source, .. } => client_error_reason(source),
+        _ => "call_error",
+    }
+}
+
+/// Bounded fail-open reason for an upstream client error. Reads only the error
+/// kind and HTTP status, never any message or response body.
+fn client_error_reason(error: &LlmClientError) -> &'static str {
+    match error {
+        LlmClientError::Timeout { .. } => "timeout",
+        LlmClientError::Transport { .. } => "transport",
+        LlmClientError::UpstreamHttp { status, .. } if *status >= 500 => "upstream_5xx",
+        LlmClientError::UpstreamHttp { .. } => "upstream_4xx",
+        LlmClientError::InvalidResponse { .. } | LlmClientError::ResponseTranslation(_) => {
+            "invalid_response"
+        }
+        _ => "client_error",
     }
 }
 
