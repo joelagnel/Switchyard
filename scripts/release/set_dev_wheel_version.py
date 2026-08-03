@@ -15,7 +15,6 @@ from pathlib import Path
 DEV_VERSION_RE = re.compile(r"^(?P<release>\d+\.\d+\.\d+)\.dev(?P<number>\d*)$")
 PACKAGE_NAME_RE = re.compile(r'^(name\s*=\s*")([^"]+)(".*)$')
 PACKAGE_VERSION_RE = re.compile(r'^(version\s*=\s*")([^"]+)(".*)$')
-PYTHON_VERSION_RE = re.compile(r'^(__version__\s*=\s*")([^"]+)(".*)$', re.MULTILINE)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -72,41 +71,23 @@ def update_pyproject(path: Path, *, package_name: str, version: str) -> bool:
     return changed
 
 
-def update_python_init(path: Path, version: str) -> bool:
-    """Set `switchyard.__version__` for the dev wheel artifact."""
-
-    text = path.read_text()
-    updated, count = PYTHON_VERSION_RE.subn(rf"\g<1>{version}\g<3>", text, count=1)
-    if count != 1:
-        raise ValueError(f"{path}: missing __version__")
-    if updated != text:
-        path.write_text(updated)
-        return True
-    return False
-
-
 def apply_version(version: DevWheelVersion, *, package_name: str) -> None:
-    """Update package metadata files used by maturin wheel builds."""
+    """Set the wheel version in pyproject.toml.
 
-    changes = [
-        (
-            "pyproject.toml",
-            update_pyproject(
-                Path("pyproject.toml"),
-                package_name=package_name,
-                version=version.version,
-            ),
-        ),
-        ("switchyard/__init__.py", update_python_init(Path("switchyard/__init__.py"), version.version)),
-    ]
+    ``switchyard.__version__`` reads the installed distribution metadata, so the
+    version lives only in pyproject.toml — there is no second copy to stamp.
+    """
 
-    changed = [path for path, did_change in changes if did_change]
+    changed = update_pyproject(
+        Path("pyproject.toml"),
+        package_name=package_name,
+        version=version.version,
+    )
     if changed:
         print("Set dev wheel metadata:")
         print(f"  Package: {package_name}")
         print(f"  Version: {version.version}")
-        for path in changed:
-            print(f"  updated {path}")
+        print("  updated pyproject.toml")
     else:
         print(f"dev wheel metadata already set for {package_name} {version.version}")
 

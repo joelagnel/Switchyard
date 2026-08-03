@@ -9,6 +9,7 @@ requests across multiple LLM backends with intelligent tier selection,
 format translation, and extensible middleware.
 """
 
+from importlib import metadata as _metadata
 from typing import TYPE_CHECKING, Any
 
 from switchyard.lib.backends import (
@@ -190,4 +191,10 @@ __all__ = [
     "AnyResponseStream",
 ]
 
-__version__ = "0.1.0"
+# Single source of truth: read the installed distribution version so this can
+# never drift from pyproject.toml. Falls back only for an uninstalled source
+# tree, where no distribution metadata exists to read.
+try:
+    __version__ = _metadata.version("nemo-switchyard")
+except _metadata.PackageNotFoundError:  # pragma: no cover - source tree without metadata
+    __version__ = "0.0.0+unknown"

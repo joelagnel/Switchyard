@@ -52,16 +52,11 @@ def test_metadata_file_updates(tmp_path: Path) -> None:
     pyproject.write_text(
         '[build-system]\nrequires = []\n\n[project]\nname = "switchyard"\nversion = "0.1.0"\n'
     )
-    init = tmp_path / "__init__.py"
-    init.write_text('__all__ = []\n\n__version__ = "0.1.0"\n')
-
     assert set_dev_wheel_version.update_pyproject(
         pyproject,
         package_name="nemo-switchyard",
         version="0.0.1.dev0",
     )
-    assert set_dev_wheel_version.update_python_init(init, "0.0.1.dev0")
 
     assert 'name = "nemo-switchyard"' in pyproject.read_text()
     assert 'version = "0.0.1.dev0"' in pyproject.read_text()
-    assert '__version__ = "0.0.1.dev0"' in init.read_text()

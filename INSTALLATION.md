@@ -2,6 +2,24 @@
 
 Switchyard supports modular installation based on your use case. Install only the dependencies you need.
 
+## Requires Python 3.12 or newer
+
+The commands below install into whatever Python is active. Switchyard needs Python
+3.12 or newer, so on a machine whose default `python3` is older — for example the
+3.11 that ships as the system Python on many systems — `pip install nemo-switchyard`
+fails with `Requires-Python >=3.12`. Install into a 3.12 interpreter. With uv, name
+the version:
+
+```bash
+uv pip install --python 3.12 nemo-switchyard
+```
+
+Or point pip at the interpreter directly:
+
+```bash
+python3.12 -m pip install nemo-switchyard
+```
+
 ## System Requirements
 
 - Linux x86_64 wheels require an x86-64-v3 / AVX2-class CPU (post 2013).
